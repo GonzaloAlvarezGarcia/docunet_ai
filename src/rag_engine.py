@@ -1,25 +1,30 @@
 import os
-from typing import List, Any
+from typing import List, Dict, Any
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 
-# LangChain Imports
-from langchain_community.graphs import Neo4jGraph
+# 1. Vector Store & Graph
 from langchain_community.vectorstores import Neo4jVector
+from langchain_community.graphs import Neo4jGraph
+
+# 2. LLM & Embeddings
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains import RetrievalQA
-from langchain_core.prompts import PromptTemplate
 
-# Load environment variables
+# 3. Text Splitting
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# 4. Chains
+from langchain_classic.chains import create_retrieval_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
+
 load_dotenv()
 
 
 class GraphRAGManager:
     """
-    Manages the RAG pipeline: PDF processing, Graph indexing, and Querying.
-    Using a class structure makes the code modular and testable (Senior approach).
+    Manages the RAG pipeline using the modern LCEL (LangChain Expression Language) architecture.
     """
 
     def __init__(self):
@@ -28,49 +33,46 @@ class GraphRAGManager:
         self.neo4j_password = os.getenv("NEO4J_PASSWORD")
         self.groq_api_key = os.getenv("GROQ_API_KEY")
 
-        # Initialize Embeddings (HuggingFace - Free and local)
-        # We use 'all-MiniLM-L6-v2' because it's fast and lightweight.
+        # We read the model from .env, with a fallback just in case
+        self.groq_model = os.getenv("GROQ_MODEL_NAME", "llama-3.3-70b-versatile")
+
+        # Initialize Embeddings (Local - HuggingFace)
         self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
-        # Initialize LLM (Groq - Llama3)
+        # Initialize LLM (Groq)
         self.llm = ChatGroq(
-            groq_api_key=self.groq_api_key,
-            model_name="llama3-8b-8192",
-            temperature=0,  # 0 for factual consistency
+            groq_api_key=self.groq_api_key, model_name=self.groq_model, temperature=0
         )
 
     def process_pdf(self, uploaded_file) -> List[str]:
         """
-        Reads a PDF file and splits it into manageable chunks.
+        Extracts text from PDF and splits it into chunks.
         """
+        text = ""
         try:
             pdf_reader = PdfReader(uploaded_file)
-            text = ""
             for page in pdf_reader.pages:
                 text += page.extract_text() or ""
 
-            # Split text into chunks to avoid hitting context limits
             text_splitter = RecursiveCharacterTextSplitter(
                 chunk_size=1000,
                 chunk_overlap=200,
                 separators=["\n\n", "\n", ".", " ", ""],
             )
-            chunks = text_splitter.split_text(text)
-            return chunks
+            return text_splitter.split_text(text)
         except Exception as e:
             print(f"Error processing PDF: {e}")
             return []
 
     def index_documents(self, text_chunks: List[str], index_name: str = "vector_index"):
         """
-        Stores the text chunks into Neo4j as a Vector Store.
-        This creates a graph structure where nodes contain text and embeddings.
+        Indexes the chunks into Neo4j AuraDB.
         """
         if not text_chunks:
             return None
 
-        # Neo4jVector automatically creates the graph nodes and vector index
-        vector_store = Neo4jVector.from_texts(
+        print("Indexing documents into Neo4j...")
+        return Neo4jVector.from_texts(
             texts=text_chunks,
             embedding=self.embeddings,
             url=self.neo4j_uri,
@@ -78,13 +80,12 @@ class GraphRAGManager:
             password=self.neo4j_password,
             index_name=index_name,
         )
-        return vector_store
 
     def get_qa_chain(self):
         """
-        Creates the RetrievalQA chain combining the Vector Store and the LLM.
+        Builds the modern RAG chain using LCEL.
         """
-        # Re-connect to the existing vector index in Neo4j
+        # 1. Connect to existing Neo4j Index
         vector_store = Neo4jVector.from_existing_index(
             embedding=self.embeddings,
             url=self.neo4j_uri,
@@ -93,29 +94,32 @@ class GraphRAGManager:
             index_name="vector_index",
         )
 
-        # Create a retriever object
-        retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+        # Convert vector store to a retriever
+        retriever = vector_store.as_retriever()
 
-        # Custom Prompt to ensure the bot acts professionally
-        prompt_template = """
-        You are a senior technical assistant. Use the following context to answer the question.
-        If you don't know the answer based on the context, say so. Do not make things up.
-        
-        Context: {context}
-        
-        Question: {question}
-        
-        Answer:
-        """
-        PROMPT = PromptTemplate(
-            template=prompt_template, input_variables=["context", "question"]
+        # 2. Define the Prompt
+        system_prompt = (
+            "You are a helpful assistant for question-answering tasks. "
+            "Use the following pieces of retrieved context to answer "
+            "the question. If you don't know the answer, say that you "
+            "don't know. Use three sentences maximum and keep the "
+            "answer concise."
+            "\n\n"
+            "{context}"
         )
 
-        # Build the chain
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=self.llm,
-            chain_type="stuff",
-            retriever=retriever,
-            chain_type_kwargs={"prompt": PROMPT},
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", system_prompt),
+                ("human", "{input}"),
+            ]
         )
-        return qa_chain
+
+        # 3. Create the Chain
+        # 'create_stuff_documents_chain' handles passing the documents to the LLM
+        question_answer_chain = create_stuff_documents_chain(self.llm, prompt)
+
+        # 'create_retrieval_chain' handles retrieving the docs + passing them to the Q&A chain
+        rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+
+        return rag_chain

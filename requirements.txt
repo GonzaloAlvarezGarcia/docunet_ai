@@ -1,0 +1,9 @@
+streamlit
+langchain-groq
+langchain-community
+langchain-core
+langchain-experimental
+neo4j
+python-dotenv
+pypdf
+tiktoken

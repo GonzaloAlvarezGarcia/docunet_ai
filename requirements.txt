@@ -2,7 +2,8 @@ streamlit
 langchain-groq
 langchain-community
 langchain-core
-langchain-experimental
+langchain-huggingface
+sentence-transformers
 neo4j
 python-dotenv
 pypdf
